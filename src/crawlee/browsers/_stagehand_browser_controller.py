@@ -16,7 +16,7 @@ from crawlee.fingerprint_suite._header_generator import fingerprint_browser_type
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from playwright.async_api import Browser, BrowserContext, Playwright
+    from playwright.async_api import Browser, BrowserContext, Page, Playwright
     from stagehand import AsyncSession, AsyncStagehand
 
     from crawlee.browsers._stagehand_types import StagehandOptions
@@ -69,6 +69,8 @@ class StagehandBrowserController(BrowserController):
         self._browser: Browser | None = None
         self._browser_context: BrowserContext | None = None
         self._context_creation_lock = Lock()
+        self._session_generated_headers: dict[str, str] = {}
+        """The HTTP headers injected into the shared browser context by the header generator, if any."""
 
         self._pages = list[StagehandPage]()
         self._total_opened_pages = 0
@@ -171,6 +173,11 @@ class StagehandBrowserController(BrowserController):
             self._opening_pages_count -= 1
 
         return page
+
+    @override
+    def get_generated_headers(self, page: Page) -> dict[str, str]:
+        # All pages share the single session context, so they share the header set injected into it.
+        return dict(self._session_generated_headers)
 
     @override
     async def close(self, *, force: bool = False) -> None:
@@ -293,6 +300,7 @@ class StagehandBrowserController(BrowserController):
         context = self._browser.contexts[0]
 
         await context.set_extra_http_headers(extra_http_headers)
+        self._session_generated_headers = dict(extra_http_headers)
 
         self._session = session
 

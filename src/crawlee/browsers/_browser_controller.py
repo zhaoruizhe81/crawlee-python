@@ -90,6 +90,15 @@ class BrowserController(ABC):
             ValueError: If the browser has reached the maximum number of open pages.
         """
 
+    def get_generated_headers(self, page: Page) -> dict[str, str]:  # noqa: ARG002 no headers by default
+        """Return the HTTP headers injected into the browser context of the given page.
+
+        Controllers that create contexts with a fingerprint or a header generator override this to report the
+        headers they injected. The default implementation returns an empty dictionary, so custom controllers that
+        do not generate headers need no changes.
+        """
+        return {}
+
     @abstractmethod
     async def close(self, *, force: bool = False) -> None:
         """Close the browser.

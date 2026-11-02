@@ -7,8 +7,10 @@ from asyncio import Lock
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
+from weakref import WeakKeyDictionary
 
 from browserforge.injectors.playwright import AsyncNewContext
+from browserforge.injectors.utils import only_injectable_headers
 from playwright.async_api import Browser, BrowserContext, Page, ProxySettings
 from playwright.async_api import BrowserType as PlaywrightBrowserType
 from typing_extensions import override
@@ -90,6 +92,10 @@ class PlaywrightBrowserController(BrowserController):
         self._browser_context: BrowserContext | None = (
             self._browser.contexts[0] if len(self._browser.contexts) > 0 else None
         )
+        self._context_generated_headers: WeakKeyDictionary[BrowserContext, dict[str, str]] = WeakKeyDictionary()
+        """The HTTP headers injected into each browser context by a fingerprint or header generator.
+
+        Weakly keyed by the context, so entries disappear together with their contexts."""
         self._pages = list[Page]()
         self._last_page_opened_at = datetime.now(timezone.utc)
 
@@ -209,6 +215,10 @@ class PlaywrightBrowserController(BrowserController):
         return page
 
     @override
+    def get_generated_headers(self, page: Page) -> dict[str, str]:
+        return dict(self._context_generated_headers.get(page.context, {}))
+
+    @override
     async def close(self, *, force: bool = False) -> None:
         """Close the browser.
 
@@ -281,14 +291,21 @@ class PlaywrightBrowserController(BrowserController):
             )
 
         if self._fingerprint_generator:
-            return await AsyncNewContext(
+            fingerprint = self._fingerprint_generator.generate()
+            context = await AsyncNewContext(
                 browser=self._browser,
-                fingerprint=self._fingerprint_generator.generate(),
+                fingerprint=fingerprint,
                 **filtered_options,
             )
+            # `AsyncNewContext` injects only the request-independent subset of the fingerprint headers via
+            # `set_extra_http_headers`, so exactly that subset is what the browser actually sends.
+            self._context_generated_headers[context] = only_injectable_headers(
+                dict(fingerprint.headers), self._browser.browser_type.name
+            )
+            return context
 
         if self._header_generator:
-            extra_http_headers = dict(
+            generated_headers = dict(
                 self._header_generator.get_specific_headers(
                     header_names={
                         'Accept',
@@ -302,7 +319,14 @@ class PlaywrightBrowserController(BrowserController):
                 )
             )
         else:
-            extra_http_headers = None
+            generated_headers = {}
 
-        filtered_options['extra_http_headers'] = filtered_options.get('extra_http_headers', extra_http_headers)
-        return await self._browser.new_context(**filtered_options)
+        injected_headers = filtered_options.get('extra_http_headers')
+        if injected_headers is None:
+            injected_headers = generated_headers or None
+            filtered_options['extra_http_headers'] = injected_headers
+
+        context = await self._browser.new_context(**filtered_options)
+        if injected_headers:
+            self._context_generated_headers[context] = injected_headers
+        return context

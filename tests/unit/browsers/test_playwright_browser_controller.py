@@ -169,3 +169,27 @@ async def test_browser_with_pre_existing_context(tmp_path: Path) -> None:
         page_1 = await controller.new_page()
         page_2 = await controller.new_page()
         assert page_1.context == page_2.context == persistent_context
+
+
+async def test_get_generated_headers_reports_injected_headers(browser: Browser) -> None:
+    """Test that the headers injected into the page's context by the header generator are reported."""
+    controller = PlaywrightBrowserController(browser)
+
+    page = await controller.new_page()
+    generated_headers = controller.get_generated_headers(page)
+    assert generated_headers
+    assert 'user-agent' in {key.lower() for key in generated_headers}
+
+    await page.close()
+    await controller.close()
+
+
+async def test_get_generated_headers_empty_without_generators(browser: Browser) -> None:
+    """Test that no generated headers are reported when neither generator is configured."""
+    controller = PlaywrightBrowserController(browser, header_generator=None, fingerprint_generator=None)
+
+    page = await controller.new_page()
+    assert controller.get_generated_headers(page) == {}
+
+    await page.close()
+    await controller.close()

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
@@ -16,3 +16,5 @@ class CrawleePage:
     id: str
     browser_type: BrowserType
     page: Page
+    generated_headers: dict[str, str] = field(default_factory=dict)
+    """HTTP headers injected into the page's browser context by a fingerprint or header generator, if any."""

@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from typing_extensions import NotRequired, TypedDict, TypeVar
 
 from crawlee._request import Request, RequestOptions, RequestState
-from crawlee._types import BasicCrawlingContext, ConcurrencySettings
+from crawlee._types import BasicCrawlingContext, ConcurrencySettings, HttpHeaders
 from crawlee._utils.blocked import RETRY_CSS_SELECTORS
 from crawlee._utils.docs import docs_group
 from crawlee._utils.robots import RobotsTxtFile
@@ -201,6 +201,12 @@ class PlaywrightCrawler(
             )
 
         self._browser_pool = browser_pool
+        self._synced_generated_headers: dict[int, dict[str, str]] = {}
+        """The headers currently synced from a page's browser context into `Request.headers`, by `id(request)`.
+
+        Values are stored as set (keyed by the name normalized in `HttpHeaders`), so that the sync can be undone
+        once the page's crawl ends and so that the navigation interceptor can skip these headers (the browser
+        already applies them at the context level)."""
 
         # Compose the context pipeline with the Playwright-specific context enhancer.
         kwargs['_context_pipeline'] = (
@@ -332,19 +338,60 @@ class PlaywrightCrawler(
         # Create a new browser page
         crawlee_page = await self._browser_pool.new_page(proxy_info=context.proxy_info)
 
+        # Headers injected into the page's browser context by a fingerprint or header generator are applied by
+        # the browser at the context level. Expose them in `request.headers` so request handlers can see what
+        # the browser actually sends. The sync is undone when this page's crawl ends, so the same `Request`
+        # object is left clean for other consumers (e.g. `AdaptivePlaywrightCrawler` static rendering or a
+        # retried attempt with a new browser context).
+        synced_headers: dict[str, str] = {}
+        if crawlee_page.generated_headers:
+            synced_headers = self._sync_generated_headers_to_request(context.request, crawlee_page.generated_headers)
+            if synced_headers:
+                self._synced_generated_headers[id(context.request)] = synced_headers
+
         pre_navigation_context = self._build_pre_nav_context(context, page=crawlee_page.page)
 
         request_id = id(pre_navigation_context.request)
 
-        # Only use the page context manager here — it sets the current page in a context variable,
-        # making it accessible to PlaywrightHttpClient in subsequent pipeline steps.
-        async with browser_page_context(crawlee_page.page):
-            for hook in self._pre_navigation_hooks:
-                async with self._shared_navigation_timeouts[request_id]:
-                    await hook(pre_navigation_context)
+        try:
+            # Only use the page context manager here — it sets the current page in a context variable,
+            # making it accessible to PlaywrightHttpClient in subsequent pipeline steps.
+            async with browser_page_context(crawlee_page.page):
+                for hook in self._pre_navigation_hooks:
+                    async with self._shared_navigation_timeouts[request_id]:
+                        await hook(pre_navigation_context)
 
-            # Yield should be inside the browser_page_context.
-            yield pre_navigation_context
+                # Yield should be inside the browser_page_context.
+                yield pre_navigation_context
+        finally:
+            if synced_headers:
+                self._synced_generated_headers.pop(id(context.request), None)
+                self._unsync_generated_headers(context.request, synced_headers)
+
+    def _sync_generated_headers_to_request(
+        self,
+        request: Request,
+        generated_headers: dict[str, str],
+    ) -> dict[str, str]:
+        """Copy the headers injected into the page's browser context into `request.headers`.
+
+        Only keys missing from `request.headers` are filled in, so headers set explicitly on the request always
+        win. Returns the values actually synced, keyed by the header name as normalized in `HttpHeaders`.
+        """
+        missing_headers = {key: value for key, value in generated_headers.items() if request.headers.get(key) is None}
+        if missing_headers:
+            request.headers = request.headers | HttpHeaders(missing_headers)
+        return {key.lower(): value for key, value in missing_headers.items()}
+
+    def _unsync_generated_headers(self, request: Request, synced_headers: dict[str, str]) -> None:
+        """Undo `_sync_generated_headers_to_request`: remove the synced headers from `request.headers`.
+
+        A synced header is removed only if its value is still exactly what was synced; headers overwritten in
+        the meantime (e.g. by a pre-navigation hook) are kept.
+        """
+        remaining_headers = {key: value for key, value in request.headers.items() if synced_headers.get(key) != value}
+        if len(remaining_headers) != len(request.headers):
+            request.headers = HttpHeaders(remaining_headers)
 
     async def _navigate(
         self,
@@ -384,12 +431,20 @@ class PlaywrightCrawler(
             )
 
         # Apply the custom method, headers, and payload to the navigation request only; the details of doing
-        # that correctly live in `NavigationRequestInterceptor`.
-        if context.request.headers or context.request.method != 'GET':
+        # that correctly live in `NavigationRequestInterceptor`. Headers synced from the page's browser context
+        # (generated by a fingerprint or header generator) are excluded: the browser already applies them at
+        # the context level, and including them here would needlessly turn on request interception.
+        synced_headers = self._synced_generated_headers.get(id(context.request), {})
+        request_headers = context.request.headers
+        if synced_headers:
+            request_headers = HttpHeaders(
+                {key: value for key, value in request_headers.items() if key not in synced_headers}
+            )
+        if request_headers or context.request.method != 'GET':
             interceptor = NavigationRequestInterceptor(
                 context.page,
                 method=context.request.method,
-                headers=context.request.headers,
+                headers=request_headers,
                 payload=context.request.payload,
             )
             await interceptor.register()
